@@ -4,6 +4,10 @@ package serialdeviceenumeratorgo
 #cgo LDFLAGS: -lsetupapi
 #include <windows.h>
 #include <setupapi.h>
+
+char is_INVALID_HANDLE_VALUE(void* p) {
+	return p == INVALID_HANDLE_VALUE;
+}
 */
 import "C"
 
@@ -15,7 +19,11 @@ import (
 	"log"
 	"strings"
 	"unsafe"
+	"regexp"
+	"encoding/hex"
 )
+
+var vidpidRegExp = regexp.MustCompile("V[iI][dD]_(\\w+)&P[iI][dD]_(\\w+)")
 
 var guidArray = [...]C.GUID{
 	/* Windows Ports Class GUID */
@@ -26,17 +34,10 @@ var guidArray = [...]C.GUID{
 	C.GUID{0x4D36E96D, 0xE325, 0x11CE, [...]C.uchar{0xBF, 0xC1, 0x08, 0x00, 0x2B, 0xE1, 0x03, 0x18}},
 }
 
-func is_INVALID_HANDLE_VALUE(p interface{}) bool {
-	if v, ok := p.(uintptr); ok {
-		return v+1 == uintptr(0)
-	}
-	return false
-}
-
 func getNativeName(DeviceInfoSet C.HDEVINFO, DeviceInfoData C.PSP_DEVINFO_DATA) (string, error) {
 	key := C.SetupDiOpenDevRegKey(DeviceInfoSet, DeviceInfoData, C.DICS_FLAG_GLOBAL, 0, C.DIREG_DEV, C.KEY_READ)
 	defer C.RegCloseKey(key)
-	if is_INVALID_HANDLE_VALUE(key) {
+	if C.is_INVALID_HANDLE_VALUE(unsafe.Pointer(key)) != C.FALSE {
 		return "", errors.New(fmt.Sprintf("Reg error: %d", int(C.GetLastError())))
 	}
 
@@ -48,13 +49,18 @@ func getNativeName(DeviceInfoSet C.HDEVINFO, DeviceInfoData C.PSP_DEVINFO_DATA) 
 		var lenKeyName C.DWORD = C.DWORD(cap(buffKeyName))
 		var lenKeyValue C.DWORD = C.DWORD(cap(buffKeyVal))
 		ret := C.RegEnumValue(key, i, &buffKeyName[0], &lenKeyName, (*C.DWORD)(nil), &keyType, &buffKeyVal[0], &lenKeyValue)
-		if ret == C.ERROR_SUCCESS && keyType == C.REG_SZ {
-			itemName := C.GoString((*C.char)(&buffKeyName[0]))
-			itemValue := C.GoString((*C.char)(unsafe.Pointer((&buffKeyVal[0]))))
-
-			if strings.Contains(itemName, "PortName") {
-				return itemValue, nil
+		i++
+		if ret == C.ERROR_SUCCESS {
+			if keyType == C.REG_SZ {
+				itemName := C.GoString((*C.char)(&buffKeyName[0]))
+				itemValue := C.GoString((*C.char)(unsafe.Pointer((&buffKeyVal[0]))))
+	
+				if strings.Contains(itemName, "PortName") {
+					return itemValue, nil
+				}
 			}
+		} else {
+			break
 		}
 	}
 
@@ -66,9 +72,14 @@ func getDeviceRegistryProperty(DeviceInfoSet C.HDEVINFO, DeviceInfoData C.PSP_DE
 	var dataSize C.DWORD = 0
 
 	C.SetupDiGetDeviceRegistryProperty(DeviceInfoSet, DeviceInfoData, property, &dataType, (*C.BYTE)(nil), (C.DWORD)(0), &dataSize)
+	
+	if (dataSize == 0) {
+		return "", nil
+	}
 	data := make([]C.BYTE, dataSize)
 
 	if C.SetupDiGetDeviceRegistryProperty(DeviceInfoSet, DeviceInfoData, property, (*C.DWORD)(nil), &data[0], dataSize, (*C.DWORD)(nil)) == C.TRUE {
+		
 		switch dataType {
 		case C.REG_EXPAND_SZ, C.REG_SZ:
 			if dataSize > 0 {
@@ -96,35 +107,38 @@ func getDeviceRegistryProperty(DeviceInfoSet C.HDEVINFO, DeviceInfoData C.PSP_DE
 			}
 			return int(*(*C.int)(unsafe.Pointer(&data[0]))), nil
 		}
-	}
-
-	return nil, errors.New("Failed to get data from regestry")
-}
-
-func getNativeDriver(service string) (string, error) {
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\services\`+service, registry.QUERY_VALUE)
-	if err != nil {
-		return "", err
-	}
-	defer k.Close()
-
-	if v, _, err := k.GetStringValue("ImagePath"); err == nil {
-		return v, nil
 	} else {
-		return "", err
+		fmt.Printf("SetupDiGetDeviceRegistryProperty() failed (%v)\n", int(C.GetLastError()))
 	}
+	
+	return nil, errors.New("Failed to get data from regestry")
 }
 
 func result2string(v interface{}, e error) (s string, err error) {
 	if e != nil {
 		return "", e
 	} else {
-		if ss, ok := v.(string); ok == false {
-			return "", errors.New("Not a string value")
-		} else {
+		if ss, ok := v.(string); ok {
 			return ss, nil
+		} else {
+			if sl, ok := v.([]string); ok {
+				return strings.Join(sl, ";"), nil
+			} else {
+				return "", errors.New("Not a string or stringlist value")
+			}
 		}
 	}
+}
+
+func getNativeDriver(service string) (string, error) {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\services\` + service, registry.QUERY_VALUE)
+	if err != nil {
+		return "", err
+	}
+	defer k.Close()
+	
+	v, _, err := k.GetStringValue("ImagePath")
+	return v, err
 }
 
 func enumerate() ([]DeviceDescription, error) {
@@ -137,11 +151,11 @@ func enumerate() ([]DeviceDescription, error) {
 	defer k.Close()
 
 	var result []DeviceDescription
-
+	
 	for i := 0; i < len(guidArray); i++ {
 		DeviceInfoSet := C.SetupDiGetClassDevs(&guidArray[i], (*C.CHAR)(nil), (*C.struct_HWND__)(nil), C.DIGCF_PRESENT)
 
-		if is_INVALID_HANDLE_VALUE(DeviceInfoSet) { // #define INVALID_HANDLE_VALUE ((HANDLE)(LONG_PTR)-1) => -1
+		if C.is_INVALID_HANDLE_VALUE(unsafe.Pointer(DeviceInfoSet)) != 0 {
 			return nil, errors.New(fmt.Sprintf(
 				`Windows: SerialDeviceEnumeratorPrivate::updateInfo() 
 				SetupDiGetClassDevs() returned INVALID_HANDLE_VALUE, 
@@ -151,14 +165,25 @@ func enumerate() ([]DeviceDescription, error) {
 		var DeviceIndex C.DWORD = 0
 		var DeviceInfoData C.SP_DEVINFO_DATA
 		DeviceInfoData.cbSize = C.DWORD(unsafe.Sizeof(DeviceInfoData))
-		for C.SetupDiEnumDeviceInfo(DeviceInfoSet, DeviceIndex, &DeviceInfoData) == C.TRUE {
+		
+		for {
+			if  C.SetupDiEnumDeviceInfo(DeviceInfoSet, DeviceIndex, &DeviceInfoData) != C.TRUE {
+				break
+			}
+			DeviceIndex++
+			
 			name, err := getNativeName(DeviceInfoSet, &DeviceInfoData)
-			if err != nil || len(name) == 0 || strings.Contains(name, "LPT") {
+			if err != nil || len(name) == 0 {
+				continue
+			}
+			
+			if strings.Contains(name, "LPT") {
 				continue
 			}
 
 			var dev DeviceDescription
 			dev.Name = name
+			dev.ShortName = name
 			if dev.Bus, err = result2string(getDeviceRegistryProperty(DeviceInfoSet, &DeviceInfoData, C.SPDRP_ENUMERATOR_NAME)); err != nil {
 				log.Printf("Error get bus of device %s: %s", name, err.Error())
 			}
@@ -183,10 +208,26 @@ func enumerate() ([]DeviceDescription, error) {
 			if dev.Service, err = result2string(getDeviceRegistryProperty(DeviceInfoSet, &DeviceInfoData, C.SPDRP_SERVICE)); err != nil {
 				log.Printf("Error get Service of device %s: %s", name, err.Error())
 			}
-
+			if dev.Driver, err = getNativeDriver(dev.Service); err != nil {
+				log.Printf("Error get Driver of device %s: %s", name, err.Error())
+			}
+			if dev.SystemPath, err = result2string(getDeviceRegistryProperty(DeviceInfoSet, &DeviceInfoData, C.SPDRP_PHYSICAL_DEVICE_OBJECT_NAME)); err != nil {
+				log.Printf("Error get SystemPath of device %s: %s", name, err.Error())
+			}
+			
+			match := vidpidRegExp.FindStringSubmatch(dev.HardwareID)
+			if len(match) > 1 {
+				var v []byte
+				if v, err = hex.DecodeString(match[1]); err == nil {
+					dev.VendorID = (uint16)(v[0]) << 8 + (uint16)(v[1])
+				}	
+				if v, err = hex.DecodeString(match[2]); err == nil {
+					dev.ProductID = (uint16)(v[0]) << 8 + (uint16)(v[1])
+				}
+			}
+			
 			result = append(result, dev)
 		}
 	}
-
-	return nil, nil
+	return result, nil
 }
