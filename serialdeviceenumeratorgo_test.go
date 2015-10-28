@@ -30,7 +30,7 @@ func TestFTDIPresent(t *testing.T) {
 			if v.VendorID == FTDI_VID && v.ProductID == FT232RL_PID {
 				t.Logf("FTDI chip FT232RL found on %s", v.Name)
 			} else {
-				t.Logf("Not FTDI chip on %s (%v, %v)", v.Name, v.VendorID, v.ProductID)
+				t.Logf(" %s is not a FTDI chip (%v, %v)", v.Name, v.VendorID, v.ProductID)
 			}
 		}
 	}
