@@ -68,6 +68,7 @@ func enumerate() ([]DeviceDescription, error) {
 					dev.SystemPath = C.GoString(C.udev_device_get_syspath(udev_device))
 					dev.ShortName = C.GoString(C.udev_device_get_property_value(
 							udev_device, C.CString("DEVNAME")))
+					dev.Name = dev.ShortName
 					dev.FriendlyName = fmt.Sprintf("%s (%s)", dev.Description, dev.ShortName)
 					
 					var v []byte
